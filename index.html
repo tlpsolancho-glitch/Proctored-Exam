@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proctored Exam</title>
+<style>
+  body{font-family:system-ui,sans-serif;margin:0;background:#f4f5f7;color:#1c1e21}
+  .wrap{max-width:760px;margin:0 auto;padding:20px}
+  .card{background:#fff;border-radius:10px;padding:20px;margin-bottom:16px;box-shadow:0 1px 3px #0002}
+  button{padding:10px 18px;border:0;border-radius:6px;background:#1a56db;color:#fff;font-size:16px;cursor:pointer}
+  button:disabled{background:#9aa}
+  input[type=text]{width:100%;padding:9px;margin:6px 0 12px;box-sizing:border-box}
+  label.opt{display:block;padding:8px;border:1px solid #ddd;border-radius:6px;margin:6px 0;cursor:pointer}
+  #cam{position:fixed;right:12px;bottom:12px;width:180px;border-radius:8px;border:3px solid #1a56db;background:#000;z-index:5}
+  #status{position:fixed;left:12px;bottom:12px;background:#000c;color:#fff;padding:8px 12px;border-radius:8px;font-size:13px;z-index:5}
+  #warn{position:fixed;top:0;left:0;right:0;background:#c81e1e;color:#fff;text-align:center;padding:8px;display:none;z-index:9}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<div id="warn"></div>
+<div class="wrap">
+
+  <!-- 1. CONSENT -->
+  <div id="consent" class="card">
+    <h2>Data Privacy Consent</h2>
+    <p>This exam is proctored. By continuing you agree that:</p>
+    <ul>
+      <li>Your camera and microphone must stay on for the whole exam.</li>
+      <li>Your webcam feed is analyzed <b>on your device</b> to detect your face and gaze direction. The video is <b>not recorded or streamed</b>.</li>
+      <li>When an event is flagged (face missing, multiple faces, looking away for several seconds, leaving the exam page, loud sound), a <b>single still image</b> and the event details are saved for your instructor to review.</li>
+      <li>Flags are only indicators. A person, not the system, decides if any action is needed.</li>
+      <li>Data is kept only as long as needed for grading and review, in line with the Data Privacy Act of 2012 (RA 10173).</li>
+    </ul>
+    <label>Full name<input type="text" id="name"></label>
+    <label>Student ID<input type="text" id="sid"></label>
+    <label><input type="checkbox" id="agree"> I have read and consent to the above.</label><br><br>
+    <button id="startBtn">Allow camera/mic and start</button>
+    <p id="err" style="color:#c81e1e"></p>
+  </div>
+
+  <!-- 2. EXAM -->
+  <div id="exam" class="hidden">
+    <div class="card"><b id="who"></b> &nbsp;|&nbsp; Flags: <b id="flagCount">0</b></div>
+    <div id="questions"></div>
+    <button id="submitBtn">Submit exam</button>
+  </div>
+
+  <div id="done" class="card hidden"></div>
+</div>
+
+<video id="cam" class="hidden" autoplay muted playsinline></video>
+<div id="status" class="hidden">Starting…</div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver } from
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+/* ====== CONFIG ====== */
+const API_URL = "https://script.google.com/a/macros/aliac.edu.ph/s/AKfycbzpPSFqMVbaKJF0PutPktAHW9gyGqCUadp2OtIlX8KvDy3OpnLoariYsI8MRjrfcEH75Q/exec";
+const CFG = {
+  gazeThreshold: 0.55,     // 0-1, higher = less sensitive
+  awaySeconds: 4,          // looking sideways/up this long = flag
+  noFaceSeconds: 3,        // face missing this long = flag
+  loudThreshold: 0.25,     // mic level 0-1 sustained = flag
+  loudSeconds: 3,
+  cooldownSeconds: 15,     // min gap between same flag type
+  requireFullscreen: true
+};
+/* ==================== */
+
+const $ = id => document.getElementById(id);
+const sessionId = crypto.randomUUID();
+let student = {}, questions = [], flags = 0, examActive = false;
+let landmarker, stream, analyser, audioBuf;
+const timers = { away: 0, noface: 0, loud: 0 };
+const lastFlag = {};
+let lastTs = performance.now();
+
+// ---------- network ----------
+async function post(payload) {
+  try {
+    const r = await fetch(API_URL, { method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ ...payload, sessionId, name: student.name, studentId: student.id }) });
+    return await r.json();
+  } catch (e) { console.warn("post failed", e); return null; }
+}
+
+// ---------- flagging ----------
+function snapshot() {
+  const v = $("cam"); if (!v.videoWidth) return "";
+  const c = document.createElement("canvas");
+  c.width = 320; c.height = Math.round(320 * v.videoHeight / v.videoWidth);
+  c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+  return c.toDataURL("image/jpeg", 0.6);
+}
+function flag(type, detail = "", withImage = true) {
+  if (!examActive) return;
+  const now = Date.now();
+  if (lastFlag[type] && now - lastFlag[type] < CFG.cooldownSeconds * 1000) return;
+  lastFlag[type] = now;
+  flags++; $("flagCount").textContent = flags;
+  showWarn("⚠ Flagged: " + type);
+  post({ action: "flag", type, detail, snapshot: withImage ? snapshot() : "" });
+}
+function showWarn(msg) {
+  const w = $("warn"); w.textContent = msg; w.style.display = "block";
+  setTimeout(() => w.style.display = "none", 3500);
+}
+
+// ---------- page-leave detection ----------
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) flag("TAB_HIDDEN", "Page hidden / tab switched");
+});
+window.addEventListener("blur", () => flag("WINDOW_BLUR", "Window lost focus"));
+document.addEventListener("fullscreenchange", () => {
+  if (examActive && CFG.requireFullscreen && !document.fullscreenElement) {
+    flag("FULLSCREEN_EXIT", "Exited fullscreen");
+  }
+});
+["copy", "cut", "paste", "contextmenu"].forEach(ev =>
+  document.addEventListener(ev, e => { if (examActive) { e.preventDefault(); flag("BLOCKED_" + ev.toUpperCase(), "", false); } }));
+window.addEventListener("beforeunload", e => { if (examActive) { e.preventDefault(); e.returnValue = ""; } });
+
+// ---------- camera / mic ----------
+async function startMedia() {
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 640, height: 480, facingMode: "user" }, audio: true });
+  const v = $("cam"); v.srcObject = stream; v.classList.remove("hidden");
+  await v.play();
+  // if user turns camera/mic off mid-exam
+  stream.getTracks().forEach(t => t.addEventListener("ended", () =>
+    flag("MEDIA_STOPPED", t.kind + " track ended", false)));
+  // mic level
+  const ac = new AudioContext();
+  const src = ac.createMediaStreamSource(stream);
+  analyser = ac.createAnalyser(); analyser.fftSize = 1024;
+  src.connect(analyser); audioBuf = new Uint8Array(analyser.fftSize);
+}
+function micLevel() {
+  analyser.getByteTimeDomainData(audioBuf);
+  let sum = 0; for (const b of audioBuf) { const x = (b - 128) / 128; sum += x * x; }
+  return Math.sqrt(sum / audioBuf.length) * 4; // rough 0-1
+}
+
+// ---------- face / gaze ----------
+async function loadModel() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  landmarker = await FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath:
+      "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" },
+    runningMode: "VIDEO", numFaces: 2, outputFaceBlendshapes: true });
+}
+function gazeOf(blend) {
+  const g = {}; blend.categories.forEach(c => g[c.categoryName] = c.score);
+  // looking left/right: one eye "out" + other eye "in"
+  const toLeft  = ((g.eyeLookOutLeft || 0) + (g.eyeLookInRight || 0)) / 2;
+  const toRight = ((g.eyeLookInLeft || 0) + (g.eyeLookOutRight || 0)) / 2;
+  const up      = ((g.eyeLookUpLeft || 0) + (g.eyeLookUpRight || 0)) / 2;
+  return { toLeft, toRight, up };
+}
+function loop() {
+  if (!examActive) return;
+  const now = performance.now(), dt = (now - lastTs) / 1000; lastTs = now;
+  const v = $("cam");
+  if (v.readyState >= 2) {
+    const res = landmarker.detectForVideo(v, now);
+    const n = res.faceLandmarks.length;
+    let status = "OK";
+    if (n === 0) {
+      timers.noface += dt; timers.away = 0;
+      status = "No face";
+      if (timers.noface > CFG.noFaceSeconds) { flag("NO_FACE", "Face not visible"); timers.noface = 0; }
+    } else {
+      timers.noface = 0;
+      if (n > 1) flag("MULTIPLE_FACES", n + " faces detected");
+      const g = gazeOf(res.faceBlendshapes[0]);
+      const away = Math.max(g.toLeft, g.toRight, g.up) > CFG.gazeThreshold;
+      timers.away = away ? timers.away + dt : 0;
+      if (away) status = "Looking away";
+      if (timers.away > CFG.awaySeconds) {
+        flag("GAZE_AWAY", `L:${g.toLeft.toFixed(2)} R:${g.toRight.toFixed(2)} U:${g.up.toFixed(2)}`);
+        timers.away = 0;
+      }
+    }
+    // loud sound
+    timers.loud = micLevel() > CFG.loudThreshold ? timers.loud + dt : 0;
+    if (timers.loud > CFG.loudSeconds) { flag("LOUD_AUDIO", "Sustained sound", false); timers.loud = 0; }
+    $("status").textContent = `Camera ${status} | Flags: ${flags}`;
+  }
+  requestAnimationFrame(loop);
+}
+
+// ---------- exam UI ----------
+const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; [a[i], a[j]] = [a[j], a[i]]; } return a; };
+function render() {
+  const box = $("questions"); box.innerHTML = "";
+  shuffle(questions).forEach((q, i) => {
+    const d = document.createElement("div"); d.className = "card";
+    d.innerHTML = `<p><b>${i + 1}.</b> ${q.q}</p>` +
+      shuffle(Object.keys(q.choices)).map(k =>
+        `<label class="opt"><input type="radio" name="q${q.id}" value="${k}"> ${q.choices[k]}</label>`).join("");
+    box.appendChild(d);
+  });
+}
+
+$("startBtn").onclick = async () => {
+  $("err").textContent = "";
+  student = { name: $("name").value.trim(), id: $("sid").value.trim() };
+  if (!student.name || !student.id) return $("err").textContent = "Enter your name and student ID.";
+  if (!$("agree").checked) return $("err").textContent = "Consent is required to take the exam.";
+  $("startBtn").disabled = true; $("startBtn").textContent = "Loading…";
+  try {
+    await startMedia();
+    await loadModel();
+    const data = await (await fetch(API_URL)).json();
+    questions = data.questions;
+    await post({ action: "start", consent: true, userAgent: navigator.userAgent });
+    if (CFG.requireFullscreen) await document.documentElement.requestFullscreen().catch(() => {});
+    $("consent").classList.add("hidden"); $("exam").classList.remove("hidden");
+    $("status").classList.remove("hidden"); $("who").textContent = student.name;
+    render(); examActive = true; lastTs = performance.now(); loop();
+  } catch (e) {
+    $("err").textContent = "Could not start: " + e.message + ". Camera and microphone access is required.";
+    $("startBtn").disabled = false; $("startBtn").textContent = "Allow camera/mic and start";
+  }
+};
+
+$("submitBtn").onclick = async () => {
+  if (!confirm("Submit your exam?")) return;
+  const answers = {};
+  questions.forEach(q => {
+    const c = document.querySelector(`input[name="q${q.id}"]:checked`);
+    answers[q.id] = c ? c.value : "";
+  });
+  examActive = false;
+  const r = await post({ action: "submit", answers, flagCount: flags });
+  stream.getTracks().forEach(t => t.stop());
+  if (document.fullscreenElement) document.exitFullscreen();
+  $("exam").classList.add("hidden"); $("cam").classList.add("hidden"); $("status").classList.add("hidden");
+  $("done").classList.remove("hidden");
+  $("done").innerHTML = r && r.ok ? "<h2>Submitted. Thank you!</h2>" : "<h2>Submission may have failed. Tell your instructor.</h2>";
+};
+</script>
+</body>
+</html>
